@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# gh-toast: macOS notifications for unread GitHub notifications, via gh.
+set -euo pipefail
+
+label="io.github.armallen.gh-toast"
+plist="$HOME/Library/LaunchAgents/$label.plist"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/gh-toast"
+seen="$state_dir/seen"
+interval="${GH_TOAST_INTERVAL:-60}"
+
+usage() {
+  cat <<EOF
+Usage: gh toast [command]
+
+  run        Notify about new unread notifications once (default)
+  install    Run every ${interval}s in the background, starting at login
+  uninstall  Stop and remove the background job
+  reset      Forget already-notified notifications
+EOF
+}
+
+notify() { # repo reason title url key
+  if command -v terminal-notifier >/dev/null; then
+    terminal-notifier -title "$1" -subtitle "$2" -message "$3" \
+      -open "$4" -group "$5" -sound default >/dev/null
+  else
+    osascript -e 'on run argv' \
+      -e 'display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)' \
+      -e 'end run' "$1" "$2" "$3"
+  fi
+}
+
+run() {
+  mkdir -p "$state_dir"
+  touch "$seen"
+  gh api notifications --jq '.[] | [.id + "@" + .updated_at, .repository.full_name, .reason, .subject.title,
+      (.subject.url // "" | sub("api.github.com/repos"; "github.com") | sub("/pulls/"; "/pull/"))] | @tsv' |
+    while IFS=$'\t' read -r key repo reason title url; do
+      grep -qxF "$key" "$seen" && continue
+      echo "$key" >>"$seen"
+      notify "$repo" "$reason" "$title" "${url:-https://github.com/notifications}" "$key"
+    done
+  tail -n 1000 "$seen" >"$seen.tmp" && mv "$seen.tmp" "$seen"
+}
+
+install() {
+  local self path
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+  path="$(dirname "$(command -v gh)"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+  mkdir -p "$state_dir" "$(dirname "$plist")"
+  # Run through bash: launchd may refuse to exec scripts carrying com.apple.provenance.
+  cat >"$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$self</string>
+    <string>run</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>$path</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>$interval</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardErrorPath</key>
+  <string>$state_dir/log</string>
+</dict>
+</plist>
+EOF
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$plist"
+  echo "Installed $plist"
+}
+
+uninstall() {
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  rm -f "$plist"
+  echo "Uninstalled"
+}
+
+case "${1:-run}" in
+  run) run ;;
+  install) install ;;
+  uninstall) uninstall ;;
+  reset) rm -f "$seen" ;;
+  help | -h | --help) usage ;;
+  *) usage >&2 && exit 1 ;;
+esac
